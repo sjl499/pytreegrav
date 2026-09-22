@@ -32,3 +32,6 @@ examples/error_benchmark.png
 /*.png
 /*.npy
 /*.npz
+
+# Local development and private-data validation (never part of the public test suite).
+/dev/

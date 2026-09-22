@@ -160,7 +160,7 @@ print("Brute force potential runtime in parallel: %gs"%(time() - t)); t = time()
     Tree potential runtime in parallel: 0.181393s
     Brute force potential runtime in parallel: 5.72611s
 
-For parallel *brute force* there are two kernels, and pytreegrav picks between them for you. The
+For default parallel *brute force* calls there are two kernels, and pytreegrav picks between them for you. The
 straightforward one gives each thread a single target particle, so it can only ever write that
 particle's own result and must therefore evaluate all N² pairs — twice the work of the serial
 upper-triangular loop. Above ``SYMMETRIC_NMIN`` particles (1000) it instead uses a symmetrized kernel
@@ -201,6 +201,56 @@ print("RMS potential error: ", phi_error)
 
     RMS force error:  0.0029070938409950310
     RMS potential error:  0.00018373931733379673
+
+# Optional potential softening and particle identity
+
+`Potential`, `PotentialTarget`, and `Field` support `softening_kernel="wendland_c2"` as well as the
+default `"cubic_spline"`. Softening replaces each point mass by a finite spherical density, keeping
+the potential finite at the origin and exactly Newtonian outside its compact support radius `H`.
+The `softening` arrays contain **compact support radii**, not Plummer-equivalent softenings or SPH
+smoothing lengths. For equal central potentials, convert a Plummer-equivalent `epsilon` using
+`H = 3 * epsilon` for Wendland C2 and `H = 2.8 * epsilon` for cubic spline. Each pair uses
+`max(H_target, H_source)`. Choose `G` consistently with your mass and length units; the returned
+specific potential has units `G * mass / length` and zero at infinity.
+
+Set `self_index="self"` to exclude each particle's own contribution while retaining other particles
+at exactly the same position. For example, these two distinct, coincident particles feel finite
+potentials from one another:
+
+```python
+x_pair = np.zeros((2, 3))
+m_pair = np.array([2.0, 3.0])
+H_pair = np.array([0.5, 1.0])
+phi = Potential(x_pair, m_pair, H_pair, method="bruteforce",
+                softening_kernel="wendland_c2", self_index="self")
+# phi == [-9.0, -6.0]: pair support is 1.0 and psi(0, H) = -3 / H, with G=1.
+U = 0.5 * np.dot(m_pair, phi)  # full population self energy, -18.0
+```
+
+For independent targets, pass an integer `self_index` array filled with `-1`; for a source subset,
+pass its original source indices. A mapped target must be at exactly its stored source position.
+With the default `self_index=None`, legacy coincidence behavior is preserved: self-direct
+summation includes distinct softened coincident particles, while target-direct and tree calls
+omit all zero-separation pairs. Selecting Wendland alone preserves that difference.
+
+For repeated queries, select the kernel when constructing a `Field`:
+
+```python
+from pytreegrav import Field
+
+f_wendland = Field(x, m, softening=h, softening_kernel="wendland_c2")
+phi = f_wendland.potential(self_index="self")
+subset = np.array([4, 1, 9])
+phi_subset = f_wendland.potential(x[subset], softening_target=h[subset], self_index=subset)
+```
+
+These options support CPU float64 potentials, serial/parallel direct summation, and static radix
+trees with monopoles or quadrupoles. `group_size=1` gives an ungrouped optional tree walk. CUDA,
+insertion/dynamic trees, and acceleration/tidal or fused derivative requests do not support them.
+A retained positive-mass pair with both zero separation and zero support raises `ValueError` in
+identity mode. See the [potential options reference](https://pytreegrav.readthedocs.io/en/latest/frontend_API.html#potential-options)
+for exact formulas, mapping/reuse rules, validation, and accuracy guidance. The default examples
+and timings elsewhere in this walkthrough use cubic-spline softening with legacy self handling.
 
 # Tidal fields
 
