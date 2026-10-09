@@ -25,6 +25,9 @@ spec = [
     # detect these anyway to avoid subdividing forever, so this is free -- and exact, unlike
     # scanning the input up front.
     ("HasCoincidentPoints", boolean),
+    ("RadixBuilt", boolean),  # source-index mapping is defined for this layout
+    ("HasMoments", boolean),  # reject spatial-only trees in selected potential paths
+    ("HasUnresolvedPoints", boolean),  # distinct points left in a terminal radix bucket
 ]
 
 
@@ -679,8 +682,11 @@ class Octree:
         self.TreewalkIndices = -ones(points.shape[0], dtype=np.int64)
         self.HasQuads = quadrupole
         self.HasCoincidentPoints = False
+        self.HasUnresolvedPoints = False
+        self.HasMoments = compute_moments
 
         radix_path = radix and morton_order
+        self.RadixBuilt = radix_path
         children = -ones((1, 8), dtype=np.int64)  # unused on the radix path; typing placeholder
         acc = zeros((1, 3))  # typing placeholders, replaced on the radix path
         parent = -ones(1, dtype=np.int64)
@@ -1132,7 +1138,7 @@ class Octree:
 
         Seeds moments the same way the digit loop does. The caller must have reserved enough node slots for the whole chain, since growing the tree here would leave acc/parent behind.
         """
-        self.HasCoincidentPoints = True  # only reachable for bit-identical positions
+        self.HasCoincidentPoints = True  # exhausted Morton keys, normally identical positions
         count = hi - lo
         cur = node
         slot = 0
@@ -1156,6 +1162,12 @@ class Octree:
                 slot = 0
                 last = -1
             c = lo + jj
+            # Exhausting the fixed re-key budget need not mean exact coincidence.
+            # Synthetic bucket cells bound identical points, but not arbitrary
+            # unresolved positions; selected potential walks reject the latter.
+            for k in range(3):
+                if self.Coordinates[c, k] != self.Coordinates[lo, k]:
+                    self.HasUnresolvedPoints = True
             mi = self.Masses[c]
             self.Masses[cur] += mi
             ac = cur - self.NumParticles

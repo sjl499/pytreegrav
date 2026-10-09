@@ -203,14 +203,14 @@ We got you covered. The ``Target`` methods do exactly this: you specify separate
    x_target = np.random.rand(N_target,3)
    h_target = np.repeat(0.01,N_target) # optional "target" softening: this sets a floor on the softening length of all forces/potentials computed
 
-   accel_tree = AccelTarget(x_target, x,m, h_target=h_target, h_source=h,method='tree') # we provide the points/masses/softenings we generated before as the "source" particles
-   accel_bruteforce = AccelTarget(x_target,x,m,h_source=h,method='bruteforce')
+   accel_tree = AccelTarget(x_target, x,m, softening_target=h_target, softening_source=h,method='tree') # we provide the points/masses/softenings we generated before as the "source" particles
+   accel_bruteforce = AccelTarget(x_target,x,m,softening_target=h_target,softening_source=h,method='bruteforce')
 
    acc_error = np.sqrt(np.mean(np.sum((accel_tree-accel_bruteforce)**2,axis=1))) # RMS force error
    print("RMS force error: ", acc_error)
 
-   phi_tree = PotentialTarget(x_target, x,m, h_target=h_target, h_source=h,method='tree') # we provide the points/masses/softenings we generated before as the "source" particles
-   phi_bruteforce = PotentialTarget(x_target,x,m,h_target=h_target, h_source=h,method='bruteforce')
+   phi_tree = PotentialTarget(x_target, x,m, softening_target=h_target, softening_source=h,method='tree') # we provide the points/masses/softenings we generated before as the "source" particles
+   phi_bruteforce = PotentialTarget(x_target,x,m,softening_target=h_target, softening_source=h,method='bruteforce')
 
    phi_error = np.std(phi_tree - phi_bruteforce)
    print("RMS potential error: ", phi_error)
@@ -219,3 +219,74 @@ We got you covered. The ``Target`` methods do exactly this: you specify separate
 
    RMS force error:  0.006719983300560105
    RMS potential error:  0.0003873676304955059
+
+
+Optional softening and explicit self exclusion
+------------------------------------------------
+
+The potential APIs accept ``softening_kernel="wendland_c2"`` or the default
+``"cubic_spline"``. Their softening arrays contain the radius of compact support,
+``H``. Convert a Plummer-equivalent softening ``epsilon`` with ``H = 3 * epsilon``
+for Wendland C2, or ``H = 2.8 * epsilon`` for cubic spline; these conversions
+match the central potential. They are not hydrodynamic smoothing-length
+conversions. The pair support is always ``max(H_target, H_source)``.
+
+Use ``self_index="self"`` for a full population with known source order. This
+excludes each particle itself and retains contributions from distinct particles
+at the same position:
+
+.. code-block:: python
+
+   phi = Potential(x, m, h, softening_kernel="wendland_c2", self_index="self")
+   U = 0.5 * np.dot(m, phi)  # energy of this complete self-interacting population
+
+Without an explicit ``self_index``, the legacy coincidence rules remain in
+effect, even when selecting Wendland: self-direct summation includes distinct
+softened coincident particles, but target-direct and tree calls omit all
+zero-separation pairs. Explicit identity makes their exclusion rules consistent.
+
+For independent targets, including targets that happen to coincide with a
+source, use ``-1`` for every target. No identity is inferred from coordinates:
+
+.. code-block:: python
+
+   phi_target = PotentialTarget(
+       x_target, x, m, softening_target=h_target, softening_source=h,
+       softening_kernel="wendland_c2",
+       self_index=np.full(len(x_target), -1, dtype=np.int64),
+   )
+
+For a reordered subset, the mapping is the index of each target in the original
+source array. The mapped target must have exactly the same float64 position as
+that source. This also works when reusing a tree:
+
+.. code-block:: python
+
+   from pytreegrav import ConstructTree, Field
+
+   tree = ConstructTree(x, m, h, quadrupole=True)
+   subset = np.array([4, 1, 9])
+   phi_subset = PotentialTarget(
+       x[subset], None, None, softening_target=h[subset], tree=tree, quadrupole=True,
+       softening_kernel="wendland_c2", self_index=subset,
+   )
+
+   field = Field(x, m, softening=h, softening_kernel="wendland_c2", quadrupole=True)
+   phi_all = field.potential(self_index="self")
+   phi_subset = field.potential(x[subset], softening_target=h[subset], self_index=subset)
+
+Source indices always refer to the order used to build that particular tree or
+``Field``, regardless of internal sorting. Rebuild after changing source
+positions, masses, or supports; a separately built source subset has its own
+local index space. ``"self"`` is available for ``Potential`` without a supplied
+tree and for ``Field.potential()`` without explicit targets. Use an integer map
+for ``PotentialTarget`` or ``Potential(..., tree=tree)``.
+
+These options currently compute only potentials on the CPU in float64. They
+support serial/parallel direct summation and static radix trees; ``group_size=1``
+selects an ungrouped optional walk. They reject insertion/dynamic trees, CUDA,
+and acceleration/tidal or fused derivative requests. A retained positive-mass
+pair at zero separation with zero pair support is singular and raises
+``ValueError`` in identity mode. See :ref:`potential-options` for the formulas,
+complete validation rules, energy conventions, and guidance on choosing
+``theta`` against a direct reference for your own data.

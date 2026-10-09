@@ -11,8 +11,10 @@ from .grouped_treewalk import (
     PotentialTarget_grouped,
     TidalTensorTarget_grouped,
     _morton_order,
+    _get_core,
 )
 from .bruteforce import *
+from .bruteforce import _PotentialTarget_options_serial, _PotentialTarget_options_parallel
 from .bruteforce_symmetric import Potential_bruteforce_symmetric, Accel_bruteforce_symmetric, SYMMETRIC_NMIN
 from .misc import *
 
@@ -48,6 +50,177 @@ def valueTestMethod(method):
     ## check if method is a valid method
     if method not in methods:
         raise ValueError("Invalid method %s. Must be one of: %s" % (method, str(methods)))
+
+
+def _potential_kernel_id(softening_kernel):
+    kernels = ("cubic_spline", "wendland_c2")
+    if not isinstance(softening_kernel, str) or softening_kernel not in kernels:
+        raise ValueError("softening_kernel must be 'cubic_spline' or 'wendland_c2'")
+    return kernels.index(softening_kernel)
+
+
+def _potential_targets(pos, softening):
+    pos = np.ascontiguousarray(np.atleast_2d(_f64(pos)))
+    if pos.ndim != 2 or pos.shape[1] != 3 or not np.all(np.isfinite(pos)):
+        raise ValueError("positions must be finite with shape (N, 3)")
+    softening = zeros(len(pos)) if softening is None else np.atleast_1d(_f64(softening))
+    if softening.shape != (len(pos),) or not np.all(np.isfinite(softening)) or np.any(softening < 0):
+        raise ValueError("softening must be finite, nonnegative, with shape (N,)")
+    return pos, np.ascontiguousarray(softening)
+
+
+def _potential_masses(m, n):
+    m = np.atleast_1d(_f64(m))
+    if m.shape != (n,) or not np.all(np.isfinite(m)) or np.any(m < 0):
+        raise ValueError("source masses must be finite, nonnegative, with shape (N,)")
+    return np.ascontiguousarray(m)
+
+
+def _potential_controls(G, theta, group_size):
+    if not np.isscalar(G) or not np.isfinite(G) or G <= 0:
+        raise ValueError("selected potential options require finite G > 0")
+    if not np.isscalar(theta) or not np.isfinite(theta) or theta <= 0:
+        raise ValueError("theta must be finite and positive")
+    if (
+        isinstance(group_size, (bool, np.bool_))
+        or not isinstance(group_size, (int, np.integer))
+        or group_size < 1
+    ):
+        raise ValueError("group_size must be a positive integer")
+
+
+def _potential_indices(self_index, n_target, n_source, allow_self=False):
+    if self_index is None:
+        return np.full(n_target, -1, dtype=np.int64)
+    if isinstance(self_index, str):
+        if self_index != "self" or not allow_self or n_target != n_source:
+            raise ValueError("self_index='self' requires self-evaluation with known source order")
+        return np.arange(n_target, dtype=np.int64)
+    indices = np.asarray(self_index)
+    if indices.shape != (n_target,) or indices.dtype.kind not in "iu":
+        raise ValueError("self_index must be an integer array with shape (N_target,)")
+    if (indices.dtype.kind == "i" and np.any(indices < -1)) or np.any(indices >= n_source):
+        raise ValueError("self_index entries must be -1 or valid original source indices")
+    return np.array(indices, dtype=np.int64, copy=True)
+
+
+def _check_potential_tree(tree):
+    if not isinstance(tree, Octree) or not tree.RadixBuilt or not tree.HasMoments:
+        raise ValueError("selected potential options require a static radix/Morton tree with moments")
+    if tree.HasUnresolvedPoints:
+        raise ValueError("selected potential options cannot use a tree with unresolved distinct radix points")
+    n = tree.NumParticles
+    if n == 0:
+        raise ValueError("selected tree evaluation requires at least one source")
+    _potential_targets(tree.Coordinates[:n], tree.Softenings[:n])
+    _potential_masses(tree.Masses[:n], n)
+
+
+def _check_potential_mapping(pos, indices, source_pos, inverse=None):
+    matched = indices >= 0
+    source_index = indices[matched]
+    if inverse is not None:
+        source_index = inverse[source_index]
+    # Validate an explicit claim of identity; never discover identity by position.
+    # Requiring the same position also guarantees the containing node is opened.
+    if not np.array_equal(pos[matched], source_pos[source_index]):
+        raise ValueError("mapped targets must equal their source positions; use -1 for independent targets")
+
+
+def _finite_potential(phi):
+    if not np.all(np.isfinite(phi)):
+        raise ValueError(
+            "nonfinite potential: retained zero-separation/zero-softening pair "
+            "or arithmetic outside the float64 range"
+        )
+    return phi
+
+
+def _potential_tree_values(
+    pos, soft, tree, indices, kernel_id, identity, G, theta, group_size, parallel, quadrupole, inverse=None
+):
+    checkTreeQuadrupoles(tree, quadrupole)
+    if identity:
+        if inverse is None:
+            inverse = np.empty(tree.NumParticles, dtype=np.int64)
+            inverse[tree.TreewalkIndices] = np.arange(tree.NumParticles, dtype=np.int64)
+        _check_potential_mapping(pos, indices, tree.Coordinates, inverse)
+    core = _get_core(True, False, False, quadrupole, parallel, kernel_id, identity)
+    return _finite_potential(core(pos, soft, tree, group_size, theta, G, 1, indices)[:, 0])
+
+
+def _potential_options(
+    pos_target,
+    pos_source,
+    m_source,
+    softening_target,
+    softening_source,
+    G,
+    theta,
+    tree,
+    return_tree,
+    parallel,
+    method,
+    quadrupole,
+    group_size,
+    softening_kernel,
+    self_index,
+    self_evaluation=False,
+):
+    """Validated opt-in dispatch; the existing default paths remain unchanged."""
+    valueTestMethod(method)
+    kernel_id = _potential_kernel_id(softening_kernel)
+    _potential_controls(G, theta, group_size)
+    pos_target, softening_target = _potential_targets(pos_target, softening_target)
+    supplied_tree = tree is not None
+    if supplied_tree:
+        _check_potential_tree(tree)
+        if method == "bruteforce":
+            raise ValueError("a supplied tree requires method='tree' or 'adaptive'")
+        n_source = tree.NumParticles
+    else:
+        if pos_source is None or m_source is None:
+            raise ValueError("pass source positions and masses, or a source tree")
+        pos_source, softening_source = _potential_targets(pos_source, softening_source)
+        n_source = len(pos_source)
+        m_source = _potential_masses(m_source, n_source)
+    identity = self_index is not None
+    indices = _potential_indices(
+        self_index, len(pos_target), n_source, self_evaluation and not supplied_tree,
+    )
+    if self_evaluation and not supplied_tree and not identity:
+        indices = np.arange(n_source, dtype=np.int64)  # legacy self-direct still excludes i == j
+    if identity and not supplied_tree:
+        _check_potential_mapping(pos_target, indices, pos_source)
+    if method == "adaptive":
+        if supplied_tree:
+            method = "tree"
+        elif self_evaluation:
+            method = "tree" if len(pos_target) > (4000 if parallel else 1000) else "bruteforce"
+        else:
+            method = "tree" if len(pos_target) * n_source > 10**6 else "bruteforce"
+    if method == "bruteforce":
+        direct = _PotentialTarget_options_parallel if parallel else _PotentialTarget_options_serial
+        phi = _finite_potential(
+            direct(
+                pos_target, softening_target, pos_source, m_source, softening_source,
+                indices, kernel_id, identity, self_evaluation, G,
+            )
+        )
+    else:
+        if tree is None:
+            if n_source == 0:
+                raise ValueError("selected tree evaluation requires at least one source")
+            tree = ConstructTree(pos_source, m_source, softening_source, quadrupole=quadrupole)
+            _check_potential_tree(tree)
+        order = _morton_order(pos_target) if len(pos_target) else np.empty(0, dtype=np.int64)
+        values = _potential_tree_values(
+            pos_target[order], softening_target[order], tree, indices[order], kernel_id, identity,
+            G, theta, group_size, parallel, quadrupole,
+        )
+        phi = np.empty_like(values)
+        phi[order] = values
+    return (phi, tree) if return_tree else phi
 
 
 def warn_if_coincident_positions(tree, softening=None):
@@ -155,6 +328,9 @@ def Potential(
     quadrupole=False,
     group_size=8,
     device="cpu",
+    *,
+    softening_kernel="cubic_spline",
+    self_index=None,
 ):
     """Gravitational potential calculation
 
@@ -169,7 +345,7 @@ def Potential(
     G: float, optional
         gravitational constant (default 1.0)
     softening: None or array_like, optional
-        shape (N,) array containing kernel support radii for gravitational softening - these give the radius of compact support of the M4 cubic spline mass distribution - set to 0 by default
+        shape (N,) array of compact-support radii for the selected gravitational kernel (default 0); each pair uses the greater source/target radius
     theta: float, optional
         cell opening angle used to control force accuracy; smaller is slower (runtime ~ theta^-3) but more accurate. (default 0.7, giving ~0.2% RMS acceleration error on a Plummer sphere; 0.5 gives ~0.1%)
     parallel: bool, optional
@@ -188,11 +364,48 @@ def Potential(
     device: str, optional
         'cpu' (default) or 'cuda'. 'cuda' needs pytreegrav[cuda] and an NVIDIA GPU, and covers the monopole tree and brute-force methods. It is float32, but its error against the CPU path stays below theta's own truncation error. Uploads the tree (or sources) on every call, which for gravity costs more than the walk does -- measured ~4x faster than 32 CPU threads at N=2.2e7, against ~32x with the tree already resident -- so for repeated evaluation hold a pytreegrav.cuda.CudaPotential/CudaAccel or their Bruteforce counterparts instead.
 
+    softening_kernel: str, optional
+        "cubic_spline" (default) or "wendland_c2". Wendland support H is three
+        times the Plummer-equivalent softening, with central potential -3*G*m/H.
+        Selecting Wendland alone preserves each path's legacy coincidence policy.
+    self_index: None, "self", or integer array, optional
+        None preserves legacy exclusion. "self" excludes each input particle's
+        own source index and requires tree=None. A shape (N,) integer array
+        excludes the named original source index per target; -1 excludes none.
+        Mapped targets must have exactly the stored source's position. Distinct
+        coincident particles are retained; an unsoftened retained pair raises.
+
+    Notes
+    -----
+    New kernel/identity options use CPU float64 potentials only, with finite
+    nonnegative masses/supports and finite G > 0. Tree evaluation requires a
+    static radix/Morton tree with moments and resolved geometry. A supplied
+    tree is authoritative: mapping indices refer to its original input order,
+    adaptive uses that tree, and explicit brute force is rejected. group_size=1
+    gives the ungrouped optional walk. All optional direct calls use a general
+    target sum rather than the symmetric optimization.
+
+    G and input units must be consistent. The result is specific potential,
+    without a factor one half; full self energy is 0.5*sum(m*phi). Validate theta
+    against potential/energy errors for the application, not force-error figures.
+
     Returns
     -------
     phi: array_like
         shape (N,) array of potentials at the particle positions
     """
+
+    if (
+        not isinstance(softening_kernel, str)
+        or softening_kernel != "cubic_spline"
+        or self_index is not None
+    ):
+        if device != "cpu":
+            raise ValueError("selected kernel/identity options support device='cpu' only")
+        return _potential_options(
+            pos, pos, m, softening, softening, G, theta, tree, return_tree,
+            parallel, method, quadrupole, group_size, softening_kernel, self_index, True,
+        )
 
     ## test if method is correct, otherwise raise a ValueError
     valueTestMethod(method)
@@ -307,6 +520,9 @@ def PotentialTarget(
     method="adaptive",
     quadrupole=False,
     group_size=8,
+    *,
+    softening_kernel="cubic_spline",
+    self_index=None,
 ):
     """Gravitational potential calculation for general N+M body case
 
@@ -321,9 +537,9 @@ def PotentialTarget(
     m_source: array_like
         shape (M,) array of source particle masses
     softening_target: array_like or None, optional
-        shape (N,) array of target particle softening radii - these give the radius of compact support of the M4 cubic spline mass distribution
+        shape (N,) array of target compact-support radii for the selected kernel; a pair uses max(target radius, source radius)
     softening_source: array_like or None, optional
-        shape (M,) array of source particle radii  - these give the radius of compact support of the M4 cubic spline mass distribution
+        shape (M,) array of source compact-support radii for the selected kernel
     G: float, optional
         gravitational constant (default 1.0)
     theta: float, optional
@@ -341,11 +557,44 @@ def PotentialTarget(
     group_size: int, optional
         Targets sharing one tree traversal, amortizing the dominant traversal cost (default 8, ~2-3x faster than 1 at equal-or-better accuracy; much larger values slow down again as group bounding boxes open more nodes). 1 reproduces the per-particle walk. Only affects the tree method.
 
+    softening_kernel: str, optional
+        "cubic_spline" (default) or "wendland_c2". See Potential for support
+        conventions, units and the CPU float64 potential-only support boundary.
+    self_index: None or integer array, optional
+        None preserves legacy coordinate exclusion. A shape (N,) integer array
+        enables identity exclusion: j names original source j, and -1 means no
+        corresponding source. Use all -1 for independent targets, including at
+        source coordinates. Repeated indices are allowed. Mapped target positions
+        must exactly equal their stored sources; no identities are inferred.
+        "self" is not accepted here; use an explicit mapping for subsets/reorders.
+
+    Notes
+    -----
+    For reuse, pass pos_source=None and m_source=None with tree. The tree's
+    stored sources are authoritative; mappings retain its original construction
+    index space. With new options, a supplied tree pins adaptive to tree and
+    conflicts with explicit brute force. Rebuild after source changes. Retained
+    zero-separation pairs require positive pair support or raise ValueError.
+    The new options require static radix/Morton trees with computed moments and
+    resolved geometry; insertion/dynamic trees and non-potential fields are not
+    supported. Source masses/supports must be nonnegative and finite, with G > 0.
+
     Returns
     -------
     phi: array_like
         shape (N,) array of potentials at the target positions
     """
+
+    if (
+        not isinstance(softening_kernel, str)
+        or softening_kernel != "cubic_spline"
+        or self_index is not None
+    ):
+        return _potential_options(
+            pos_target, pos_source, m_source, softening_target, softening_source,
+            G, theta, tree, return_tree, parallel, method, quadrupole, group_size,
+            softening_kernel, self_index,
+        )
 
     ## test if method is correct, otherwise raise a ValueError
     valueTestMethod(method)
@@ -932,12 +1181,42 @@ class Field:
     parallel: bool, optional
         parallelize over groups; may be overridden per call (default False)
 
+    softening_kernel: str, optional
+        "cubic_spline" (default) or "wendland_c2", fixed at construction.
+        Wendland permits potential-only evaluation. Its compact-support radius
+        is H=3*epsilon_Plummer; pair supports use the maximum source/target value.
+
     Notes
     -----
-    The sources are fixed once the tree is built. Move the particles and you need a new ``Field``.
+    Source positions, masses, softenings and the selected kernel are fixed once
+    built; changing them requires a new Field. Do not mutate the stored tree.
+    Wendland or explicit self_index evaluations support CPU float64 potential
+    only; acceleration, tidal and mixed requests raise rather than mixing kernels.
+    See Potential for validation, singularity handling and legacy coincidences.
     """
 
-    def __init__(self, pos, m, softening=None, G=1.0, theta=0.7, quadrupole=False, group_size=8, parallel=False):
+    def __init__(
+        self,
+        pos,
+        m,
+        softening=None,
+        G=1.0,
+        theta=0.7,
+        quadrupole=False,
+        group_size=8,
+        parallel=False,
+        *,
+        softening_kernel="cubic_spline",
+    ):
+        self.softening_kernel = softening_kernel
+        self._kernel_id = _potential_kernel_id(softening_kernel)
+        self._potential_tree_checked = False
+        if self._kernel_id:
+            pos, softening = _potential_targets(pos, softening)
+            m = _potential_masses(m, len(pos))
+            _potential_controls(G, theta, group_size)
+            if len(pos) == 0:
+                raise ValueError("Field requires at least one source")
         # coerce exactly as the functional API does -- see the note in Accel
         pos = np.atleast_2d(_f64(pos))
         m = np.atleast_1d(_f64(m))
@@ -976,6 +1255,8 @@ class Field:
         theta=None,
         parallel=None,
         group_size=None,
+        *,
+        self_index=None,
     ):
         """Evaluate any combination of the fields in a single tree traversal.
 
@@ -994,6 +1275,16 @@ class Field:
         theta, parallel, group_size: optional
             per-call overrides of the values given to the constructor
 
+        self_index: None, "self", or integer array, optional
+            None retains legacy coordinate exclusion. "self" excludes the
+            corresponding original source and requires pos_target=None. Otherwise
+            pass shape (M,) original-source indices, using -1 for unrelated targets.
+            Mapped target positions must equal their stored source positions.
+            Distinct coincident sources remain and require positive pair support.
+            With self_index supplied, only potential=True is supported. Self
+            evaluation uses stored source softenings; an explicit softening_target
+            override is rejected in the optional path.
+
         Returns
         -------
         dict
@@ -1004,6 +1295,32 @@ class Field:
         theta = self.theta if theta is None else theta
         parallel = self.parallel if parallel is None else parallel
         group_size = self.group_size if group_size is None else group_size
+        extended = self._kernel_id != 0 or self_index is not None
+        if extended:
+            if not potential or accel or tidal:
+                raise ValueError("selected kernel/identity options support potential-only Field evaluation")
+            _potential_controls(self.G, theta, group_size)
+            if not self._potential_tree_checked:
+                _check_potential_tree(self.tree)
+                self._potential_tree_checked = True
+            if pos_target is None:
+                if softening_target is not None:
+                    raise ValueError("self-evaluation uses the stored source softenings")
+                indices = _potential_indices(self_index, self.tree.NumParticles, self.tree.NumParticles, True)
+                order = self._idx
+                sorted_pos, sorted_soft = self._pos_sorted, self._soft_sorted
+            else:
+                pos_target, softening_target = _potential_targets(pos_target, softening_target)
+                indices = _potential_indices(self_index, len(pos_target), self.tree.NumParticles)
+                order = _morton_order(pos_target) if len(pos_target) else np.empty(0, dtype=np.int64)
+                sorted_pos, sorted_soft = pos_target[order], softening_target[order]
+            values = _potential_tree_values(
+                sorted_pos, sorted_soft, self.tree, indices[order], self._kernel_id, self_index is not None,
+                self.G, theta, group_size, parallel, self.quadrupole, self._inv,
+            )
+            phi = np.empty_like(values)
+            phi[order] = values
+            return {"potential": phi}
 
         if pos_target is None:  # self-evaluation: reuse the permutation built in __init__
             sorted_pos, sorted_soft, unsort = self._pos_sorted, self._soft_sorted, self._inv

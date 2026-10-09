@@ -11,7 +11,7 @@ import numpy as np
 from math import sqrt
 from numba import njit, prange, parallel_chunksize
 
-from .kernel import ForceKernel, PotentialKernel, TidalKernel
+from .kernel import ForceKernel, PotentialKernel, PotentialKernelSelected, TidalKernel
 from .treewalk import acceptance_criterion
 from .octree import _morton_keys, _radix_argsort
 
@@ -42,7 +42,7 @@ from .octree import _morton_keys, _radix_argsort
 # --------------------------------------------------------------------------------------------------
 
 
-def _make_field_kernel(want_pot, want_accel, want_tidal, quadrupole):
+def _make_field_kernel(want_pot, want_accel, want_tidal, quadrupole, kernel_id=0, indexed=False):
     """Build the per-interaction kernel for one combination of requested fields.
 
     Output components are packed contiguously in the order potential, acceleration, tidal -- only the
@@ -52,12 +52,16 @@ def _make_field_kernel(want_pot, want_accel, want_tidal, quadrupole):
     cost 3 adds against a reshape-free (N,3,3) view, and only 6 products are actually formed.
     """
 
-    @njit(inline="always", fastmath=True)
-    def kernel(no, a, b, pos, soft, tree, acc):
+    extended = kernel_id != 0 or indexed
+
+    @njit(inline="always", fastmath=not extended)
+    def kernel(no, a, b, pos, soft, tree, acc, self_index):
         cx = tree.Coordinates[no, 0]
         cy = tree.Coordinates[no, 1]
         cz = tree.Coordinates[no, 2]
         M = tree.Masses[no]
+        if extended and M == 0.0:
+            return  # in particular, do not multiply a singular kernel by zero
         hs = tree.Softenings[no]
         # only nodes carry quadrupole moments; leaf particles contribute the softened monopole alone
         is_node = no >= tree.NumParticles if quadrupole else False
@@ -73,11 +77,23 @@ def _make_field_kernel(want_pot, want_accel, want_tidal, quadrupole):
             qzy = tree.Quadrupoles[no, 2, 1]
             qzz = tree.Quadrupoles[no, 2, 2]
         for t in range(a, b):
+            # The map always names original ConstructTree input indices.
+            if indexed and no < tree.NumParticles:
+                if tree.TreewalkIndices[no] == self_index[t]:
+                    continue
             dx = cx - pos[t, 0]
             dy = cy - pos[t, 1]
             dz = cz - pos[t, 2]
             r2 = dx * dx + dy * dy + dz * dz
-            if r2 > 0:  # no self-interaction
+            if extended and (
+                not np.isfinite(r2)
+                or (r2 < np.finfo(np.float64).tiny and (dx != 0.0 or dy != 0.0 or dz != 0.0))
+            ):
+                # Report unsupported distance arithmetic outside the parallel
+                # loop; never silently turn overflow into a finite zero field.
+                acc[t - a, 0] = -np.inf
+                continue
+            if r2 > 0 or (indexed and no < tree.NumParticles):  # legacy coordinate exclusion remains the default
                 r = sqrt(r2)
                 ht = max(hs, soft[t])
                 softened = r < ht
@@ -86,7 +102,10 @@ def _make_field_kernel(want_pot, want_accel, want_tidal, quadrupole):
                 K = 0.0
                 Q = 0.0
                 if want_pot:
-                    phi = M * PotentialKernel(r, ht) if softened else -M / r
+                    if extended:
+                        phi = M * PotentialKernelSelected(r, ht, kernel_id)
+                    else:
+                        phi = M * PotentialKernel(r, ht) if softened else -M / r
                 if want_accel or want_tidal:
                     K = M * ForceKernel(r, ht) if softened else M / (r * r2)
                 if want_tidal:
@@ -160,13 +179,13 @@ def _make_field_kernel(want_pot, want_accel, want_tidal, quadrupole):
 # --------------------------------------------------------------------------------------------------
 
 
-def _make_core(kernel, parallel):
+def _make_core(kernel, parallel, extended=False):
     """Build a jitted grouped-walk core specialized to ``kernel`` (inlined) and ``parallel``.
 
-    Returns a njit function core(pos, soft, tree, group_size, theta, G, W) -> (N, W) field array, where W is the output width (3 for acceleration, 1 for potential) and pos/soft are in tree (Morton) order.  Separate instances are built per kernel so numba inlines each kernel.
+    Returns a njit function core(pos, soft, tree, group_size, theta, G, W, self_index) -> (N, W) field array, where W is the output width (3 for acceleration, 1 for potential) and pos/soft are in tree (Morton) order.  Separate instances are built per kernel so numba inlines each kernel.
     """
 
-    def core(pos, soft, tree, group_size, theta, G, W):
+    def core(pos, soft, tree, group_size, theta, G, W, self_index):
         """Grouped Barnes-Hut walk: traverse the tree once per group of ``group_size`` targets.
 
         For each group, computes its bounding box and max softening, descends the tree accepting or opening nodes by the group's nearest-corner distance (r_min) and max softening, and lets ``kernel`` accumulate each accepted element's contribution over the group's targets.  Returns G times the accumulated field as an (N, W) array in the input (Morton) order.
@@ -228,8 +247,22 @@ def _make_core(kernel, parallel):
                         dzm = cz - bmax2
                     r_min = sqrt(dxm * dxm + dym * dym + dzm * dzm)
                     h = max(tree.Softenings[no], hmax)
-                    if no < tree.NumParticles or acceptance_criterion(r_min, h, tree.Sizes[no], tree.Deltas[no], theta):
-                        kernel(no, a, b, pos, soft, tree, acc)
+                    if no < tree.NumParticles:
+                        accept = True
+                    elif extended:
+                        # A cube's half-diagonal plus its COM offset bounds
+                        # every source distance from the COM. This keeps all
+                        # softened pairs, and mapped self particles, out of
+                        # accepted Newtonian multipoles (also for quadrupoles).
+                        size = tree.Sizes[no]
+                        delta = tree.Deltas[no]
+                        accept = np.isfinite(r_min) and r_min > max(
+                            size / theta + delta, h + 0.8660254037844387 * size + delta
+                        )
+                    else:
+                        accept = acceptance_criterion(r_min, h, tree.Sizes[no], tree.Deltas[no], theta)
+                    if accept:
+                        kernel(no, a, b, pos, soft, tree, acc, self_index)
                         no = tree.NextBranch[no]
                     else:
                         no = tree.FirstSubnode[no]
@@ -238,13 +271,13 @@ def _make_core(kernel, parallel):
                         out[t, k] = G * acc[t - a, k]
         return out
 
-    return njit(core, fastmath=True, parallel=parallel)
+    return njit(core, fastmath=not extended, parallel=parallel)
 
 
 _CORE_CACHE = {}
 
 
-def _get_core(want_pot, want_accel, want_tidal, quadrupole, parallel):
+def _get_core(want_pot, want_accel, want_tidal, quadrupole, parallel, kernel_id=0, indexed=False):
     """Jitted grouped-walk core for one field set, built on first use and memoized.
 
     Lazy rather than a table built at import: there are 2^3-1 field sets x quadrupole x parallel = 28
@@ -253,10 +286,14 @@ def _get_core(want_pot, want_accel, want_tidal, quadrupole, parallel):
     not ``cache=True`` (see the note in bruteforce.py: both parallel variants would share one on-disk
     entry keyed by qualname and the parallel dispatcher would silently load the serial code).
     """
-    key = (want_pot, want_accel, want_tidal, quadrupole, parallel)
+    extended = kernel_id != 0 or indexed
+    if extended and (not want_pot or want_accel or want_tidal):
+        raise ValueError("selected kernel/identity options support potential-only evaluation")
+    key = (want_pot, want_accel, want_tidal, quadrupole, parallel, kernel_id, indexed)
     core = _CORE_CACHE.get(key)
     if core is None:
-        core = _make_core(_make_field_kernel(want_pot, want_accel, want_tidal, quadrupole), parallel)
+        kernel = _make_field_kernel(want_pot, want_accel, want_tidal, quadrupole, kernel_id, indexed)
+        core = _make_core(kernel, parallel, extended)
         _CORE_CACHE[key] = core
     return core
 
@@ -383,7 +420,10 @@ def FieldsTarget_grouped(
     if not (potential or accel or tidal):
         raise ValueError("request at least one of potential=True, accel=True, tidal=True")
     core = _get_core(potential, accel, tidal, quadrupole, parallel)
-    out = core(pos, soft, tree, group_size, theta, G, _field_width(potential, accel, tidal))
+    out = core(
+        pos, soft, tree, group_size, theta, G, _field_width(potential, accel, tidal),
+        np.empty(0, dtype=np.int64),
+    )
     result = {}
     o = 0
     if potential:

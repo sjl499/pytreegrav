@@ -50,6 +50,45 @@ PotentialTarget_bruteforce_parallel = njit(PotentialTarget_bruteforce, fastmath=
 PotentialTarget_bruteforce = njit(PotentialTarget_bruteforce, fastmath=True)
 
 
+def _PotentialTarget_options(
+    x_target, softening_target, x_source, m_source, softening_source,
+    self_index, kernel_id, identity, self_evaluation, G=1.0,
+):
+    """Selected float64 potential with an explicit source-index exclusion map."""
+    potential = np.zeros(x_target.shape[0], dtype=np.float64)
+    for i in prange(x_target.shape[0]):
+        value = 0.0
+        for j in range(x_source.shape[0]):
+            if j == self_index[i] or m_source[j] == 0.0:
+                continue
+            dx = x_target[i, 0] - x_source[j, 0]
+            dy = x_target[i, 1] - x_source[j, 1]
+            dz = x_target[i, 2] - x_source[j, 2]
+            r2 = dx * dx + dy * dy + dz * dz
+            # A finite zero potential can hide overflow in the distance, and
+            # underflow must not turn a separated pair into a coincident pair.
+            if not np.isfinite(r2) or (
+                r2 < np.finfo(np.float64).tiny and (dx != 0.0 or dy != 0.0 or dz != 0.0)
+            ):
+                value = -np.inf
+                break
+            r = sqrt(r2)
+            h = max(softening_target[i], softening_source[j])
+            # Kernel choice alone preserves the two legacy coincidence policies.
+            # Identity mode retains every pair except the explicitly mapped self.
+            if r == 0.0 and not identity:
+                if not self_evaluation or h == 0.0:
+                    continue
+            value += m_source[j] * PotentialKernelSelected(r, h, kernel_id)
+        potential[i] = G * value
+    return potential
+
+
+# Shared Python function: caching both dispatchers could load serial code for parallel.
+_PotentialTarget_options_parallel = njit(_PotentialTarget_options, fastmath=False, parallel=True)
+_PotentialTarget_options_serial = njit(_PotentialTarget_options, fastmath=False)
+
+
 @njit(fastmath=True, cache=True)
 def Potential_bruteforce(x, m, softening, G=1.0):
     """Returns the exact mutually-interacting gravitational potential for a set of particles with positions x and masses m, evaluated by brute force.

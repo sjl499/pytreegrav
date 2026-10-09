@@ -73,3 +73,27 @@ def PotentialKernel(r, h):
         ) * hinv
     else:
         return -1.0 / r
+
+
+@njit(fastmath=False, cache=True)
+def PotentialKernelSelected(r, h, kernel_id):
+    """Unit-mass potential; h is the pair's compact-support radius.
+
+    kernel_id is 0 for the existing cubic spline, 1 for Wendland C2.
+    Wendland's normalized density is 21/(2*pi*h**3)*(1-q)**4*(1+4*q).
+    Integrating this density gives the polynomial below (q=r/h).
+    Reference convention: SWIFT c1c602152b7745c15e0790940069a3d314781dfb.
+    """
+    if r == 0.0:
+        if h == 0.0:
+            # Keep the singularity until the Python wrapper can report it,
+            # without raising inside a parallel loop. Zero masses are skipped.
+            return -float("inf")
+        return (-2.8 if kernel_id == 0 else -3.0) / h
+    if h == 0.0 or r >= h:
+        return -1.0 / r
+    if kernel_id == 0:
+        return PotentialKernel(r, h)
+    q = r / h
+    q2 = q * q
+    return (-3.0 + q2 * (7.0 + q2 * (-21.0 + q * (28.0 + q * (-15.0 + 3.0 * q))))) / h
